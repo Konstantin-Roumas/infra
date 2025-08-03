@@ -8,16 +8,15 @@ spec:
   mode: cluster
   image: "docker.io/bitnami/spark:3.5"
   imagePullPolicy: Always
-  mainClass: org.apache.spark.examples.SparkPi
-  mainApplicationFile: "local:///opt/bitnami/spark/examples/jars/spark-examples_2.12-3.5.1.jar"
+  mainApplicationFile: "local:///opt/bitnami/spark/examples/src/main/python/pi.py" # ✅ Point to the python file
   sparkVersion: "3.5.1"
   restartPolicy:
     type: Never
   driver:
-    cores: 0.1
+    cores: 1
     memory: "512m"
     serviceAccount: spark
   executor:
-    cores: 0.1
+    cores: 1
     instances: 2
     memory: "512m"

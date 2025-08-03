@@ -15,7 +15,7 @@ with DAG(
     submit_spark_pi = SparkKubernetesOperator(
         task_id="submit_spark_pi_task",
         application_file="spark-jobs/spark.yml",  # Path to the YAML file inside the Airflow containers
-        namespace="spark",
+        namespace="spark-operator",
         kubernetes_conn_id="kubernetes_default",
         do_xcom_push=True,
     )

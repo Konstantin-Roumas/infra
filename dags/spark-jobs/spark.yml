@@ -4,7 +4,7 @@ metadata:
   name: spark-pi
   namespace: spark-operator
 spec:
-  type: pyspark-pi
+  type: Python
   mode: cluster
   image: "docker.io/bitnami/spark:3.5"
   imagePullPolicy: Always

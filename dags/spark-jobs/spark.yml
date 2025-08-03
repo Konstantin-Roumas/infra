@@ -2,9 +2,9 @@ apiVersion: "sparkoperator.k8s.io/v1beta2"
 kind: SparkApplication
 metadata:
   name: spark-pi
-  namespace: spark
+  namespace: spark-operator
 spec:
-  type: Scala
+  type: pyspark-pi
   mode: cluster
   image: "docker.io/bitnami/spark:3.5"
   imagePullPolicy: Always

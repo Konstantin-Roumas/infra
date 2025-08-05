@@ -1,0 +1,8 @@
+spec:
+  containers:
+  - name: spark-operator-controller
+    image: ghcr.io/kubeflow/spark-operator/controller:2.3.0
+    args:
+    - controller
+    - start
+    - --namespaces=spark-operator

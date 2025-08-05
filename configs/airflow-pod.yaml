@@ -1,0 +1,34 @@
+# /path/to/your/airflow-log-reader-rbac.yaml
+
+# 1. This Role defines the permission to read pod logs
+#    in the namespace where Spark jobs run.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-pod-log-reader-role
+  namespace: spark-operator # <-- IMPORTANT: The namespace where Spark pods run
+rules:
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+
+---
+
+# 2. This RoleBinding grants the above permissions to your
+#    Airflow worker's Service Account.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-pod-log-reader-binding
+  namespace: spark-operator # <-- IMPORTANT: The namespace where Spark pods run
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: airflow-pod-log-reader-role
+subjects:
+- kind: ServiceAccount
+  name: airflow-worker # <-- The name of Airflow's Service Account
+  namespace: airflow    # <-- The namespace where Airflow runs

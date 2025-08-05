@@ -1,0 +1,3 @@
+config:
+  webserver:
+    secretKey: "751ff9676876564190859bd75feaac07"

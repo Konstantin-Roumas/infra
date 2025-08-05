@@ -1,0 +1,1 @@
+helm upgrade --install airflow apache-airflow/airflow -f ../configs/airflow-values.yaml --namespace airflow

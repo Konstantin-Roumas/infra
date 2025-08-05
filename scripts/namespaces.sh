@@ -1,0 +1,1 @@
+kubectl create namespace airflow && kubectl create namespace spark-operator

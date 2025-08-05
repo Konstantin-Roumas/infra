@@ -1,0 +1,15 @@
+dags:
+  persistence:
+    # When using gitSync, you don't need persistent volume for DAGs
+    enabled: false
+
+  gitSync:
+    enabled: true
+    # -- The repository URL for your DAGs
+    repo: "https://github.com/Konstantin-Roumas/infra.git"
+    # -- The branch, tag, or commit hash to sync
+    branch: "main"
+    # -- (Optional) The sub-path within the repo where DAGs are located
+    subPath: "dags/"
+    # -- (Optional) The sync interval in seconds
+    wait: 60

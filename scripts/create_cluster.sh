@@ -1,0 +1,1 @@
+minikube start --driver=docker --cpus=8 --memory=12000

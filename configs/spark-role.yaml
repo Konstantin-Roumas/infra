@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-spark-manager
+  namespace: spark-operator
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+- apiGroups: ["sparkoperator.k8s.io"]
+  resources:
+  - sparkapplications
+  - sparkapplications/status
+  verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]

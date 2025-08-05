@@ -1,0 +1,22 @@
+apiVersion: "sparkoperator.k8s.io/v1beta2"
+kind: SparkApplication
+metadata:
+  name: spark-pi
+  namespace: spark-operator
+spec:
+  type: Python
+  mode: cluster
+  image: "docker.io/bitnami/spark:3.5"
+  imagePullPolicy: Always
+  mainApplicationFile: "local:///opt/bitnami/spark/examples/src/main/python/pi.py"
+  sparkVersion: "3.5.1"
+  restartPolicy:
+    type: Never
+  driver:
+    cores: 1
+    memory: "1024m"
+    serviceAccount: spark
+  executor:
+    cores: 1
+    instances: 1
+    memory: "1024m"

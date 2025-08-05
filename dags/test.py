@@ -17,5 +17,5 @@ with DAG(
         application_file="spark-jobs/spark.yml",  # Path to the YAML file inside the Airflow containers
         namespace="spark-operator",
         kubernetes_conn_id="kubernetes_default",
-        do_xcom_push=True,
+        do_xcom_push=False,
     )

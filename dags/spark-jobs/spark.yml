@@ -40,6 +40,8 @@ spec:
       allowPrivilegeEscalation: false
       seccompProfile:
         type: RuntimeDefault
+    labels:
+      version: 4.0.0
   executor:
     instances: 1
     cores: 1

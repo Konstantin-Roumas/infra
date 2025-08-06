@@ -29,7 +29,7 @@ spec:
   driver:
     cores: 1
     memory: 512m
-    serviceAccount: spark-operator-spark
+    serviceAccount: spark-spark-operator-spark
     securityContext:
       capabilities:
         drop:

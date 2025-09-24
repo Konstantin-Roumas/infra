@@ -172,10 +172,10 @@ def main(current_metric_id: int):
     final_periods_df = calculate_final_periods(intersections_df)
     print("INFO: Step 4: Final periods calculated using iterative subtraction.")
 
-    gaps_df = rp.calculate_gaps(final_periods_df, dfs, SCOPE_PK)
+    gaps_df = rp.calculate_gaps(final_periods_df, dfs[ORIGINAL_SCOPE_TABLE], SCOPE_PK)
     print("INFO: Step 5: Found 'gaps' (periods without property).")
 
-    unmatched_df = rp.find_unmatched_scopes(final_periods_df, dfs, SCOPE_PK)
+    unmatched_df = rp.find_unmatched_scopes(final_periods_df, dfs[ORIGINAL_SCOPE_TABLE], SCOPE_PK)
     print("INFO: Step 6: Found unmatched scopes.")
 
     final_result_df = rp.assemble_final_result(
@@ -195,7 +195,7 @@ def main(current_metric_id: int):
     spark.stop()
 
 if __name__ == '__main__':
-    metric_id_str = "6"
+    metric_id_str = os.environ.get("METRIC_ID")
     if metric_id_str:
         main(int(metric_id_str))
     else:

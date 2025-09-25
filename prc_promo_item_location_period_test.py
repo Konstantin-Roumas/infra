@@ -18,6 +18,7 @@ def extract_data_for_procedure(spark: SparkSession) -> dict:
     """Extracts data from necessary SQL tables for this specific scope."""
     dfs = {
         "property_norm": read_jdbc_data("property_norm", spark),
+        "metric_cluster_link": read_jdbc_data("metric_cluster_link", spark),
         NORM_SCOPE_TABLE: read_jdbc_data(NORM_SCOPE_TABLE, spark),
         ORIGINAL_SCOPE_TABLE: read_jdbc_data(ORIGINAL_SCOPE_TABLE, spark),
         "condition": read_jdbc_data("condition", spark),
@@ -28,11 +29,13 @@ def extract_data_for_procedure(spark: SparkSession) -> dict:
 def find_intersections(
         promo_item_location_period_norm_df: DataFrame,
         property_norm_df: DataFrame,
+        mcl_df: DataFrame,
         metric_id: int
 ) -> DataFrame:
-    """Finds all valid intersections between scope data and properties."""
+    """Finds all valid intersections between scope data and properties (+metric_cluster_link)."""
     scope = promo_item_location_period_norm_df.alias("scope")
     prop = property_norm_df.alias("prop")
+    mcl = mcl_df.alias("mcl")
 
     join_condition = (
             (F.col("prop.metric_id") == metric_id) &
@@ -58,11 +61,18 @@ def find_intersections(
         )
     for col_name in cluster_cols_with_zero:
         join_condition = join_condition & (
-                F.coalesce(F.col(f"prop.{col_name}"), F.col(f"scope.{col_name}"), F.lit(0)) == \
+                F.coalesce(F.col(f"prop.{col_name}"), F.col(f"scope.{col_name}"), F.lit(0)) ==
                 F.coalesce(F.col(f"scope.{col_name}"), F.lit(0))
         )
 
-    intersections_df = scope.join(prop, join_condition, "inner").select(
+    intersections_df = scope.join(prop, join_condition, "inner") \
+        .join(
+            mcl,
+            (F.col("prop.property_id") == F.col("mcl.property_id")) &
+            (F.col("prop.metric_id") == F.col("mcl.metric_id")),
+            "left"
+        ) \
+        .select(
         F.col("scope.item_id"),
         F.col("scope.location_id"),
         F.col("scope.promo_id"),
@@ -70,8 +80,14 @@ def find_intersections(
         F.least(F.col("prop.end_date"), F.col("scope.end_dt")).alias("end_dt"),
         F.col("prop.property_id"),
         F.col("prop.is_exception"),
-        F.col("prop.order_number")
+        F.col("prop.order_number"),
+        F.col("mcl.order_number").alias("mcl_order_number")
     )
+
+    # Жёсткая проверка полноты MCL
+    if intersections_df.filter(F.col("mcl_order_number").isNull()).head(1):
+        raise ValueError("Отсутствует metric_cluster_link.order_number для части свойств — заполните приоритеты в metric_cluster_link.")
+
     return intersections_df
 
 # --- Main Orchestrator ---
@@ -89,9 +105,10 @@ def main(current_metric_id: int):
     intersections_df = find_intersections(
         promo_item_location_period_norm_df=dfs[NORM_SCOPE_TABLE],
         property_norm_df=dfs["property_norm"],
+        mcl_df=dfs["metric_cluster_link"],
         metric_id=current_metric_id
     )
-    print("INFO: Step 3: Found intersections.")
+    print("INFO: Step 3: Found intersections (with metric_cluster_link).")
 
     final_periods_df = rp.calculate_final_periods(intersections_df, SCOPE_PK)
     print("INFO: Step 4: Calculated final periods after slicing and gluing.")

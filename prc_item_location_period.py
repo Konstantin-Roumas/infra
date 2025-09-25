@@ -9,8 +9,8 @@ from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
-
 property_norm = "property_norm"
+metric_cluster_link = "metric_cluster_link"
 item_location_period_norm = "item_location_period_norm"
 item_location_period = "item_location_period"
 condition = "condition"
@@ -19,17 +19,16 @@ unit = "unit"
 #working tables
 result_item_location_period='result_item_location_period'
 
-
-
 def create_root_calc_id(spark: SparkSession, table_name):
     root_calc = read_jdbc_data(spark=spark, table_name=table_name)
-    max_root_calc_id = root_calc.agg(F.max("reversal_id")).collect()[0][0] + 1
-    return max_root_calc_id
+    max_root_calc_id = root_calc.agg(F.max("reversal_id")).collect()[0][0] or 0
+    return max_root_calc_id + 1
 
 def extract_data_for_procedure(spark: SparkSession):
     """Extracts data from necessary SQL tables."""
     dfs = {
         "property_norm": read_jdbc_data(property_norm, spark),
+        "metric_cluster_link": read_jdbc_data(metric_cluster_link, spark),
         "item_location_period_norm": read_jdbc_data(item_location_period_norm, spark),
         "item_location_period": read_jdbc_data(item_location_period, spark),
         "condition": read_jdbc_data(condition, spark),
@@ -37,15 +36,19 @@ def extract_data_for_procedure(spark: SparkSession):
     }
     return dfs
 
+def _effective_priority_col() -> F.Column:
+    return F.coalesce(F.col("mcl_order_number"), F.col("order_number"))
 
 def find_intersections(
         item_location_period_norm_df: DataFrame,
         property_norm_df: DataFrame,
+        mcl_df: DataFrame,
         metric_id: int
 ) -> DataFrame:
-    """Finds all valid intersections between scope data and properties."""
+    """Finds all valid intersections between scope data and properties и подмешивает mcl.order_number."""
     scope = item_location_period_norm_df.alias("scope")
     prop = property_norm_df.alias("prop")
+    mcl = mcl_df.alias("mcl")
 
     join_condition = (
         (F.col("prop.metric_id") == metric_id) &
@@ -73,112 +76,137 @@ def find_intersections(
             F.coalesce(F.col(f"scope.{col_name}"), F.lit(0))
         )
 
-    intersections_df = scope.join(prop, join_condition, "inner").select(
-        F.col("scope.item_id"),
-        F.col("scope.location_id"),
-        F.greatest(F.col("prop.start_date"), F.col("scope.begin_dt")).alias("begin_dt"),
-        F.least(F.col("prop.end_date"), F.col("scope.end_dt")).alias("end_dt"),
-        F.col("prop.property_id"),
-        F.col("prop.is_exception"),
-        F.col("prop.order_number")
-    )
+    intersections_df = scope.join(prop, join_condition, "inner") \
+        .join(
+            mcl,
+            (F.col("prop.property_id") == F.col("mcl.property_id")) &
+            (F.col("prop.metric_id") == F.col("mcl.metric_id")),
+            "left"
+        ) \
+        .select(
+            F.col("scope.item_id"),
+            F.col("scope.location_id"),
+            F.greatest(F.col("prop.start_date"), F.col("scope.begin_dt")).alias("begin_dt"),
+            F.least(F.col("prop.end_date"), F.col("scope.end_dt")).alias("end_dt"),
+            F.col("prop.property_id"),
+            F.col("prop.is_exception"),
+            F.col("prop.order_number"),                             # fallback
+            F.col("mcl.order_number").alias("mcl_order_number")     # основной приоритет
+        )
+
+    if intersections_df.filter(F.col("mcl_order_number").isNull()).head(1):
+        raise ValueError("Отсутствует metric_cluster_link.order_number для части свойств — заполните приоритеты в metric_cluster_link.")
+
     return intersections_df
 
-# ======================================================================================
-# REFACTORED SECTION: The calculate_final_periods function has been completely replaced.
-# ======================================================================================
+def _detect_conflicts_for_item_scope(intersections_df: DataFrame) -> None:
+    """
+    Противоречия: >1 property_id с одинаковым effective_priority и is_exception в перекрывающихся периодах.
+    """
+    df = intersections_df.withColumn("effective_priority", _effective_priority_col())
+
+    left = df.select(
+        "item_id", "location_id", "property_id", "is_exception",
+        "order_number", "mcl_order_number", "effective_priority",
+        F.col("begin_dt").alias("l_begin"), F.col("end_dt").alias("l_end")
+    )
+    right = df.select(
+        "item_id", "location_id", "property_id", "is_exception",
+        "order_number", "mcl_order_number", "effective_priority",
+        F.col("begin_dt").alias("r_begin"), F.col("end_dt").alias("r_end")
+    )
+
+    joined = left.alias("l").join(
+        right.alias("r"),
+        on=[
+            F.col("l.item_id") == F.col("r.item_id"),
+            F.col("l.location_id") == F.col("r.location_id"),
+            F.col("l.property_id") != F.col("r.property_id"),
+            F.col("l.is_exception") == F.col("r.is_exception"),
+            F.col("l.effective_priority") == F.col("r.effective_priority"),
+            (F.col("l.l_begin") <= F.col("r.r_end")) & (F.col("l.l_end") >= F.col("r.r_begin"))
+        ],
+        how="inner"
+    ).limit(1)
+
+    if joined.head(1):
+        raise ValueError("Найдены противоречивые настройки: одинаковый приоритет (metric_cluster_link.order_number) у нескольких свойств в перекрывающихся периодах.")
+
 
 def calculate_final_periods(intersections_df: DataFrame) -> DataFrame:
     """
-    Calculates final periods using the "Iterative Subtraction" algorithm to match the
-    PostgreSQL fnc_get_period logic. It subtracts date ranges of higher-priority
-    properties from lower-priority ones.
+    Iterative Subtraction: упорядочиваем свойства по
+    is_exception DESC → effective_priority ASC → property_id ASC
+    (effective_priority = coalesce(mcl_order_number, order_number)),
+    затем вычитаем предшествующие интервалы.
     """
     scope_pk_cols = ["item_id", "location_id"]
+    df = intersections_df
 
-    # Define a UDF to perform the period subtraction for a single row.
+    _detect_conflicts_for_item_scope(df)
+
     def subtract_periods_udf_logic(current_start, current_end, blocker_starts, blocker_ends):
         if current_start > current_end:
             return []
-            
         if blocker_starts is None or len(blocker_starts) == 0:
             return [(current_start, current_end)]
 
-        blockers = sorted(zip(blocker_starts, blocker_ends))
-        
-        # Initial period to be chipped away
-        available_periods = [(current_start, current_end)]
+        pairs = sorted(zip(blocker_starts, blocker_ends))
+        available = [(current_start, current_end)]
 
-        for b_start, b_end in blockers:
-            if b_start > b_end: # Skip invalid blocker periods
+        for b_start, b_end in pairs:
+            if b_start > b_end:
                 continue
-
-            next_available_periods = []
-            for a_start, a_end in available_periods:
-                # No overlap: blocker is before or after the available period
+            next_available = []
+            for a_start, a_end in available:
                 if b_end < a_start or b_start > a_end:
-                    next_available_periods.append((a_start, a_end))
+                    next_available.append((a_start, a_end))
                     continue
-
-                # Left part remains
                 if a_start < b_start:
                     new_end = b_start - timedelta(days=1)
-                    if a_start <= new_end: # Defensive check
-                        next_available_periods.append((a_start, new_end))
-                
-                # Right part remains
+                    if a_start <= new_end:
+                        next_available.append((a_start, new_end))
                 if a_end > b_end:
                     new_start = b_end + timedelta(days=1)
-                    if new_start <= a_end: # Defensive check
-                        next_available_periods.append((new_start, a_end))
-            
-            available_periods = next_available_periods
-            if not available_periods:
-                break # Nothing left to subtract from
-        
-        return available_periods
+                    if new_start <= a_end:
+                        next_available.append((new_start, a_end))
+            available = next_available
+            if not available:
+                break
+        return available
 
-    # Define the schema for the UDF's return type
     udf_return_schema = ArrayType(StructType([
         StructField("start_dt", DateType(), False),
         StructField("end_dt", DateType(), False)
     ]))
-
     subtract_periods_udf = F.udf(subtract_periods_udf_logic, udf_return_schema)
 
-    # Define a window to get all preceding (higher-priority) date ranges
     priority_window = Window.partitionBy(*scope_pk_cols) \
-        .orderBy(F.col("is_exception").desc(), F.col("order_number").asc(), F.col("property_id").asc()) \
-        .rowsBetween(Window.unboundedPreceding, Window.currentRow-1)
+        .orderBy(
+            F.col("is_exception").desc(),
+            _effective_priority_col().asc(),
+            F.col("property_id").asc()
+        ).rowsBetween(Window.unboundedPreceding, Window.currentRow-1)
 
-    # For each property, collect the date ranges of all higher-priority properties
-    periods_with_blockers = intersections_df.withColumn(
-        "blocker_starts", F.collect_list("begin_dt").over(priority_window)
-    ).withColumn(
-        "blocker_ends", F.collect_list("end_dt").over(priority_window)
-    )
+    periods_with_blockers = df.withColumn("blocker_starts", F.collect_list("begin_dt").over(priority_window)) \
+                              .withColumn("blocker_ends", F.collect_list("end_dt").over(priority_window))
 
-    # Apply the UDF to calculate the final, valid periods for each property
     result_with_period_arrays = periods_with_blockers.withColumn(
         "final_periods",
         subtract_periods_udf(F.col("begin_dt"), F.col("end_dt"), F.col("blocker_starts"), F.col("blocker_ends"))
     )
 
-    # Explode the array of structs into separate rows and filter out empty results
-    final_periods_df = result_with_period_arrays \
-        .filter(F.size("final_periods") > 0) \
+    final_periods_df = result_with_period_arrays.filter(F.size("final_periods") > 0) \
         .withColumn("period", F.explode("final_periods")) \
         .select(
             *scope_pk_cols,
             F.col("period.start_dt").alias("begin_dt"),
             F.col("period.end_dt").alias("end_dt"),
             "property_id",
-            "is_exception",
-            "order_number"
+            "is_exception"
         ).orderBy(*scope_pk_cols, "begin_dt")
 
     return final_periods_df
-
 
 def calculate_gaps(final_periods_df: DataFrame, original_scope_df: DataFrame) -> DataFrame:
     """Calculates "gaps" - date periods without any property."""
@@ -193,21 +221,20 @@ def calculate_gaps(final_periods_df: DataFrame, original_scope_df: DataFrame) ->
         .withColumn("min_begin_dt", F.min("final.begin_dt").over(Window.partitionBy(*scope_pk_cols))) \
         .withColumn("max_end_dt", F.max("final.end_dt").over(Window.partitionBy(*scope_pk_cols)))
 
-    gap_at_start = processed_periods \
-        .filter((F.col("final.begin_dt") == F.col("min_begin_dt")) & (F.col("orig.begin_dt") < F.col("final.begin_dt"))) \
-        .select(*scope_pk_cols, F.col("orig.begin_dt").alias("begin_dt"), (F.col("final.begin_dt") - F.expr("INTERVAL 1 DAY")).alias("end_dt"))
+    gap_at_start = processed_periods.filter(
+        (F.col("final.begin_dt") == F.col("min_begin_dt")) & (F.col("orig.begin_dt") < F.col("final.begin_dt"))
+    ).select(*scope_pk_cols, F.col("orig.begin_dt").alias("begin_dt"), (F.col("final.begin_dt") - F.expr("INTERVAL 1 DAY")).alias("end_dt"))
 
-    gap_at_end = processed_periods \
-        .filter((F.col("final.end_dt") == F.col("max_end_dt")) & (F.col("orig.end_dt") > F.col("final.end_dt"))) \
-        .select(*scope_pk_cols, (F.col("final.end_dt") + F.expr("INTERVAL 1 DAY")).alias("begin_dt"), F.col("orig.end_dt").alias("end_dt"))
+    gap_at_end = processed_periods.filter(
+        (F.col("final.end_dt") == F.col("max_end_dt")) & (F.col("orig.end_dt") > F.col("final.end_dt"))
+    ).select(*scope_pk_cols, (F.col("final.end_dt") + F.expr("INTERVAL 1 DAY")).alias("begin_dt"), F.col("orig.end_dt").alias("end_dt"))
 
-    gaps_in_middle = processed_periods \
-        .filter(F.col("prev_end_dt").isNotNull() & (F.col("final.begin_dt") - F.expr("INTERVAL 1 DAY") > F.col("prev_end_dt"))) \
-        .select(*scope_pk_cols, (F.col("prev_end_dt") + F.expr("INTERVAL 1 DAY")).alias("begin_dt"), (F.col("final.begin_dt") - F.expr("INTERVAL 1 DAY")).alias("end_dt"))
+    gaps_in_middle = processed_periods.filter(
+        F.col("prev_end_dt").isNotNull() & (F.col("final.begin_dt") - F.expr("INTERVAL 1 DAY") > F.col("prev_end_dt"))
+    ).select(*scope_pk_cols, (F.col("prev_end_dt") + F.expr("INTERVAL 1 DAY")).alias("begin_dt"), (F.col("final.begin_dt") - F.expr("INTERVAL 1 DAY")).alias("end_dt"))
 
     gaps_df = gap_at_start.unionByName(gap_at_end).unionByName(gaps_in_middle)
     return gaps_df
-
 
 def find_unmatched_scopes(final_periods_df: DataFrame, original_scope_df: DataFrame) -> DataFrame:
     """Finds rows in the scope without any property."""
@@ -215,7 +242,6 @@ def find_unmatched_scopes(final_periods_df: DataFrame, original_scope_df: DataFr
     matched_scopes = final_periods_df.select(*scope_pk_cols).distinct()
     unmatched_df = original_scope_df.join(matched_scopes, scope_pk_cols, "left_anti")
     return unmatched_df
-
 
 def assemble_final_result(
         final_periods_df: DataFrame, gaps_df: DataFrame, unmatched_df: DataFrame,
@@ -227,12 +253,10 @@ def assemble_final_result(
 
     gaps_prepared_df = gaps_df.withColumn("property_id", F.lit(None).cast(LongType())) \
         .withColumn("is_exception", F.lit(False)) \
-        .withColumn("order_number", F.lit(None).cast(IntegerType())) \
         .withColumn("metric_id", F.lit(metric_id))
 
     unmatched_prepared_df = unmatched_df.withColumn("property_id", F.lit(None).cast(LongType())) \
         .withColumn("is_exception", F.lit(False)) \
-        .withColumn("order_number", F.lit(None).cast(IntegerType())) \
         .withColumn("metric_id", F.lit(metric_id))
 
     combined_df = periods_with_props.unionByName(gaps_prepared_df).unionByName(unmatched_prepared_df)
@@ -249,7 +273,6 @@ def assemble_final_result(
         ).orderBy(*scope_pk_cols, "begin_dt")
     return final_df
 
-
 def main(current_metric_id):
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
@@ -264,12 +287,13 @@ def main(current_metric_id):
     intersections_df = find_intersections(
         item_location_period_norm_df=dfs["item_location_period_norm"],
         property_norm_df=dfs["property_norm"],
+        mcl_df=dfs["metric_cluster_link"],
         metric_id=current_metric_id
     )
-    print("INFO: Step 3 results: Found intersections.")
+    print("INFO: Step 3 results: Found intersections (with metric_cluster_link).")
 
     final_periods_df = calculate_final_periods(intersections_df)
-    print("INFO: Step 4 results: Final periods calculated using iterative subtraction.")
+    print("INFO: Step 4 results: Final periods calculated using iterative subtraction with MCL prioritization.")
 
     gaps_df = calculate_gaps(final_periods_df, dfs["item_location_period"])
     print("INFO: Step 5 results: Found 'gaps' (periods without property).")
@@ -293,7 +317,6 @@ def main(current_metric_id):
 
     spark.stop()
 
-
 if __name__ == '__main__':
     metric_id_str = os.environ.get("METRIC_ID")
     if metric_id_str:
@@ -301,5 +324,3 @@ if __name__ == '__main__':
         main(metric_id)
     else:
         print("ERROR: METRIC_ID environment variable not set.")
-
-
